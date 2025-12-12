@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""
+DACM PPO Agent for LunarLanderContinuous-v2
+
+This repository implements a Dual-Attention Cognitive Module (DACM) feature extractor
+with intrinsic motivation and auxiliary loss for PPO in Stable-Baselines3.
+"""
+
+import time
+from typing import Dict, Optional
+
+import gymnasium as gym
+import numpy as np
+import torch as th
+import torch.nn as nn
+import torch.nn.functional as F
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.policies import ActorCriticPolicy
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
+from stable_baselines3.common.utils import get_device
+from stable_baselines3.common.vec_env import DummyVecEnv, VecEnvWrapper, VecNormalize
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+DEVICE = get_device("auto")
+ENV_NAME = "LunarLanderContinuous-v2"
+
+LATENT_DIM = 128
+FEATURES_DIM = 256
+PPC_BITS = 32
+SPARSITY_TARGET = 0.08
+
+N_ENVS = 8
+TOTAL_TIMESTEPS = 1_000_000
+LEARNING_RATE = 2.5e-4
+N_STEPS = 1024
+BATCH_SIZE = 128
+N_EPOCHS = 10
+GAMMA = 0.99
+GAE_LAMBDA = 0.95
+CLIP_RANGE = 0.2
+ENT_COEF = 0.01
+VF_COEF = 0.5
+MAX_GRAD_NORM = 0.5
+
+AUX_COEF = 1e-2
+RINT_CLIP = 0.5
+RINT_SCALE = 1.0
+RINT_EPS = 1e-8
+SEED = 42
+
+
+# ---------------------------------------------------------
+# Compatibility wrapper for old Gym API
+# ---------------------------------------------------------
+class OldApiWrapper(gym.Wrapper):
+    """Wraps environments to handle the old Gym API."""
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        done = terminated or truncated
+        return obs, reward, done, info
+
+    def reset(self, **kwargs):
+        result = self.env.reset(**kwargs)
+        if isinstance(result, tuple) and len(result) == 2:
+            obs, _ = result
+            return obs
+        return result
+
+
+# ---------------------------------------------------------
+# Intrinsic reward normalizer
+# ---------------------------------------------------------
+class IntrinsicModule(nn.Module):
+    """Normalizes intrinsic rewards using online running statistics."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_mu", th.tensor(0.0))
+        self.register_buffer("_var", th.tensor(1.0))
+        self.register_buffer("_count", th.tensor(1e-4))
+
+    def update_stats(self, x: th.Tensor):
+        x = x.detach()
+        batch_mu = x.mean()
+        batch_var = x.var(unbiased=False)
+        batch_count = x.numel()
+
+        mu = self._mu
+        var = self._var
+        count = self._count
+
+        delta = batch_mu - mu
+        total = count + batch_count
+
+        new_mu = mu + delta * (batch_count / total)
+        m_a = var * count
+        m_b = batch_var * batch_count
+        M2 = m_a + m_b + delta.pow(2) * (count * batch_count / total)
+        new_var = M2 / total
+
+        self._mu.copy_(new_mu)
+        self._var.copy_(new_var.clamp(min=RINT_EPS))
+        self._count.fill_(total)
+
+    def forward(self, r_raw: th.Tensor) -> th.Tensor:
+        std = th.sqrt(self._var + RINT_EPS)
+        r = (r_raw - self._mu) / std
+        r = th.clamp(r * RINT_SCALE, -RINT_CLIP, RINT_CLIP)
+        return r.unsqueeze(-1)
+
+
+# ---------------------------------------------------------
+# Auxiliary loss module
+# ---------------------------------------------------------
+class AuxModule(nn.Module):
+    """Computes auxiliary loss for reconstruction and sparsity."""
+
+    def forward(self, recon: th.Tensor, sparsity_loss: th.Tensor, diss_mean: float):
+        weight = th.clamp(0.4 - diss_mean * 0.5, 0.05, 0.4)
+        return (recon * weight + sparsity_loss * 0.1).mean() * AUX_COEF
+
+
+# ---------------------------------------------------------
+# Cognitive components
+# ---------------------------------------------------------
+class PerceiverIO(nn.Module):
+    """PerceiverIO-like module with latent attention and optional feedback."""
+
+    def __init__(self, dim_in: int, dim: int = LATENT_DIM, n_latents: int = 32, n_blocks: int = 3):
+        super().__init__()
+        self.proj = nn.Linear(dim_in, dim)
+        self.latents = nn.Parameter(th.randn(1, n_latents, dim) * 0.02)
+        self.blocks = nn.ModuleList([
+            nn.MultiheadAttention(dim, 8, batch_first=True, bias=False)
+            for _ in range(n_blocks)
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(2 * n_blocks)])
+
+    def forward(self, x: th.Tensor, feedback: th.Tensor = None) -> th.Tensor:
+        x = self.proj(x).unsqueeze(1)
+        L = self.latents.expand(x.size(0), -1, -1)
+
+        if feedback is not None:
+            L = L + feedback.unsqueeze(1) * 0.3
+
+        for i, attn in enumerate(self.blocks):
+            L = L + attn(self.norms[2 * i](L), x, x)[0] * 0.1
+            L = L + F.gelu(self.norms[2 * i + 1](L)) * 0.1
+
+        return L.mean(1)
+
+
+class ConsciousBottleneck(nn.Module):
+    """Compress latent representation into a conscious bottleneck."""
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(LATENT_DIM, 128),
+            nn.GELU(),
+            nn.Linear(128, PPC_BITS),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return self.net(x)
+
+
+class DissonanceDetector(nn.Module):
+    """Detects dissonance and reconstruction error in the latent + bottleneck features."""
+
+    def __init__(self):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Linear(LATENT_DIM + PPC_BITS, 256),
+            nn.GELU(),
+            nn.Linear(256, 128),
+            nn.GELU(),
+        )
+        self.recon = nn.Linear(128, LATENT_DIM + PPC_BITS)
+        self.diss = nn.Linear(128, 1)
+
+    def forward(self, pa: th.Tensor, ppc: th.Tensor):
+        x = th.cat([pa, ppc], dim=-1)
+        h = self.enc(x)
+        recon_loss = F.mse_loss(self.recon(h), x, reduction="none").mean(dim=1)
+        diss = th.sigmoid(self.diss(h)).squeeze(-1)
+        return diss, recon_loss
+
+
+# ---------------------------------------------------------
+# Feature extractor
+# ---------------------------------------------------------
+class DACMExtractor(BaseFeaturesExtractor):
+    """Combined feature extractor for PPO using DACM modules."""
+
+    def __init__(self, observation_space, features_dim: int = FEATURES_DIM):
+        super().__init__(observation_space, features_dim)
+        dim_in = observation_space.shape[0]
+
+        self.pa = PerceiverIO(dim_in)
+        self.sa = PerceiverIO(dim_in)
+        self.ppc = ConsciousBottleneck()
+        self.cd = DissonanceDetector()
+        self.out = nn.Linear(LATENT_DIM + PPC_BITS, features_dim)
+
+        self.intrinsic = IntrinsicModule()
+        self.aux = AuxModule()
+
+        self.signals: Dict[str, th.Tensor] = {}
+        self.logs: Dict[str, float] = {}
+
+    def forward(self, obs: th.Tensor) -> th.Tensor:
+        obs = obs.float()
+        z_pa = self.pa(obs)
+        z_sa = self.sa(obs, feedback=z_pa)
+        ppc = self.ppc(z_sa)
+
+        diss, recon = self.cd(z_pa, ppc)
+        diss_mean = diss.mean().item()
+
+        sparsity = (ppc > 0.1).float().mean(dim=1)
+        sparsity_loss = (sparsity - SPARSITY_TARGET).pow(2)
+
+        r_int_raw = diss * th.clamp(1.5 - diss.mean(), 0.5, 1.5)
+        self.intrinsic.update_stats(r_int_raw)
+        r_int = self.intrinsic(r_int_raw)
+
+        aux_loss = self.aux(recon, sparsity_loss, diss_mean)
+
+        self.signals = {"r_int": r_int, "aux": aux_loss}
+        self.logs = {
+            "dacm/dissonance": float(diss.mean()),
+            "dacm/sparsity": float(sparsity.mean()),
+            "dacm/r_int_mean": float(r_int.mean()),
+            "dacm/aux_loss": float(aux_loss),
+        }
+
+        return self.out(th.cat([z_pa, ppc], dim=-1))
+
+
+# ---------------------------------------------------------
+# Intrinsic reward environment wrapper
+# ---------------------------------------------------------
+class IntrinsicEnvWrapper(VecEnvWrapper):
+    """Adds intrinsic rewards from the policy to the environment rewards."""
+
+    def __init__(self, venv, policy):
+        super().__init__(venv)
+        self.policy = policy
+
+    def step_wait(self):
+        step = self.venv.step_wait()
+        if len(step) == 5:
+            obs, rews, terminated, truncated, infos = step
+            dones = np.logical_or(terminated, truncated)
+        else:
+            obs, rews, dones, infos = step
+
+        with th.no_grad():
+            obs_t = th.as_tensor(obs).float().to(self.policy.device)
+            _ = self.policy.extract_features(obs_t)
+            r_int = self.policy.features_extractor.signals["r_int"].detach().cpu().numpy()
+            if r_int.ndim == 2 and r_int.shape[1] == 1:
+                r_int = r_int.squeeze(-1)
+            r_int = r_int.astype(np.float32)
+
+        rews = np.asarray(rews, dtype=np.float32) + r_int
+        return obs, rews, dones, infos
+
+
+# ---------------------------------------------------------
+# Policy class
+# ---------------------------------------------------------
+class DACMPolicy(ActorCriticPolicy):
+    """PPO policy exposing DACM signals."""
+
+    def get_signals(self):
+        return self.features_extractor.signals
+
+
+# ---------------------------------------------------------
+# PPO extension with auxiliary loss
+# ---------------------------------------------------------
+class DACMAlgo(PPO):
+    """PPO algorithm extended with DACM auxiliary loss."""
+
+    def train(self):
+        self._update_learning_rate(self.policy.optimizer)
+        clip_range = self.clip_range(self._current_progress_remaining) \
+            if callable(self.clip_range) else self.clip_range
+
+        for _ in range(self.n_epochs):
+            for data in self.rollout_buffer.get(self.batch_size):
+                values, log_prob, entropy = self.policy.evaluate_actions(
+                    data.observations, data.actions
+                )
+                aux_loss = self.policy.get_signals()["aux"]
+
+                values = values.flatten()
+                adv = data.advantages
+                if self.normalize_advantage and adv.numel() > 1:
+                    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+                ratio = th.exp(log_prob - data.old_log_prob)
+                s1 = ratio * adv
+                s2 = th.clamp(ratio, 1.0 - clip_range, 1.0 + clip_range) * adv
+                policy_loss = -th.min(s1, s2).mean()
+
+                value_loss = F.mse_loss(data.returns, values)
+                entropy_loss = entropy.mean() if entropy is not None else th.zeros((), device=self.device)
+
+                loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy_loss + aux_loss
+
+                self.policy.optimizer.zero_grad()
+                loss.backward()
+                th.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
+                self.policy.optimizer.step()
+
+        self._n_updates += self.n_epochs
+
+
+# ---------------------------------------------------------
+# Logging callback
+# ---------------------------------------------------------
+class LogCallback(BaseCallback):
+    """Logs DACM signals and saves the model periodically."""
+
+    def __init__(self, save_freq: int = 50_000):
+        super().__init__()
+        self.save_freq = save_freq
+
+    def _on_rollout_end(self):
+        for k, v in self.model.policy.features_extractor.logs.items():
+            self.logger.record(k, v)
+        return True
+
+    def _on_step(self):
+        if hasattr(self, "num_timesteps") and self.num_timesteps > 0:
+            if self.num_timesteps % self.save_freq == 0:
+                try:
+                    self.model.save(f"dacm_step_{self.num_timesteps}")
+                except Exception:
+                    pass
+        return True
+
+
+# ---------------------------------------------------------
+# Environment creator
+# ---------------------------------------------------------
+def make_env(seed: int):
+    def fn():
+        env = gym.make(ENV_NAME)
+        env = OldApiWrapper(env)
+        try:
+            env.reset(seed=seed)
+        except TypeError:
+            env.seed(seed)
+        np.random.seed(seed)
+        return env
+    return fn
+
+
+# ---------------------------------------------------------
+# Main training
+# ---------------------------------------------------------
+def main():
+    th.manual_seed(SEED)
+    np.random.seed(SEED)
+
+    # Create vectorized environment
+    venv = DummyVecEnv([make_env(SEED + i) for i in range(N_ENVS)])
+
+    # Policy configuration
+    policy_kwargs = dict(
+        features_extractor_class=DACMExtractor,
+        features_extractor_kwargs=dict(features_dim=FEATURES_DIM),
+        net_arch=dict(pi=[256, 128], vf=[256, 128]),
+    )
+
+    # Instantiate model
+    model = DACMAlgo(
+        DACMPolicy,
+        venv,  # temporary env
+        policy_kwargs=policy_kwargs,
+        learning_rate=LEARNING_RATE,
+        n_steps=N_STEPS,
+        batch_size=BATCH_SIZE,
+        n_epochs=N_EPOCHS,
+        gamma=GAMMA,
+        gae_lambda=GAE_LAMBDA,
+        clip_range=CLIP_RANGE,
+        ent_coef=ENT_COEF,
+        vf_coef=VF_COEF,
+        max_grad_norm=MAX_GRAD_NORM,
+        verbose=1,
+        device=DEVICE,
+        tensorboard_log="./dacm_logs/",
+    )
+
+    # Wrap environment with intrinsic rewards and normalization
+    venv = IntrinsicEnvWrapper(venv, model.policy)
+    venv = VecNormalize(venv, norm_obs=True, norm_reward=True, clip_reward=10.)
+    model.set_env(venv)
+
+    # Train
+    callback = LogCallback(save_freq=50_000)
+    start = time.time()
+    model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
+    duration = time.time() - start
+    print(f"Training finished in {duration:.2f}s")
+
+    # Save model and VecNormalize stats
+    model.save("dacm_final")
+    venv.save("vec_normalize.pkl")
+
+
+if __name__ == "__main__":
+    main()
